@@ -57,10 +57,11 @@ In the application you can:
 4. Choose the output MP4 and select **Start Concatenation**.
 
 While FFmpeg is running, the input and output controls are locked and **Cancel**
-is enabled. The status bar displays the completed percentage and an estimated
-time remaining based on the videos' total duration and FFmpeg's current speed.
-If a duration cannot be read, concatenation still works with an indeterminate
-progress indicator.
+is enabled. The status bar displays elapsed wall-clock time, the completed
+percentage, and an estimated time remaining based on the videos' total duration
+and FFmpeg's current speed. If a duration cannot be read, concatenation still
+works with an indeterminate progress indicator while elapsed time continues to
+update.
 
 Cancel first stops FFmpeg and then removes the per-job manifest and partial
 output. Source videos are never cleanup targets. FFmpeg writes to a unique

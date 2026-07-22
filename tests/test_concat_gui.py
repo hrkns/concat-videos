@@ -257,3 +257,29 @@ def test_progress_displays_percentage_eta_and_unknown_fallback(
     assert window.progress.maximum() == 0
     assert window.progress.format() == "Time remaining unavailable"
     assert "time remaining unavailable" in window.status_label.text().lower()
+
+
+def test_elapsed_time_updates_from_start_and_remains_after_finish(
+    window: ConcatWindow,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(concat_gui, "monotonic", lambda: clock[0])
+
+    window._set_running(True)
+    assert window.elapsed_label.isVisibleTo(window)
+    assert window.elapsed_label.text() == "Elapsed 0:00"
+    assert window._elapsed_timer.isActive()
+
+    clock[0] = 165.9
+    window._refresh_elapsed_time()
+    assert window.elapsed_label.text() == "Elapsed 1:05"
+
+    clock[0] = 3762.4
+    window._refresh_elapsed_time()
+    assert window.elapsed_label.text() == "Elapsed 1:01:02"
+
+    window._set_running(False)
+    assert not window._elapsed_timer.isActive()
+    assert window.elapsed_label.isVisibleTo(window)
+    assert window.elapsed_label.text() == "Elapsed 1:01:02"

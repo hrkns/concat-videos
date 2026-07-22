@@ -8,6 +8,7 @@ import os
 import sys
 from math import ceil, isfinite
 from pathlib import Path
+from time import monotonic
 
 try:
     from PySide6.QtCore import QDir, QObject, QThread, QTimer, Qt, Signal, Slot
@@ -199,11 +200,15 @@ class ConcatWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: ConcatWorker | None = None
         self._pending_outcome: tuple[str, str] | None = None
+        self._started_at: float | None = None
 
         self.setWindowTitle("Concatenate Videos")
         self.setMinimumSize(760, 600)
         self.resize(920, 720)
         self._build_ui()
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._refresh_elapsed_time)
         self._connect_signals()
         self._refresh_actions()
 
@@ -301,7 +306,11 @@ class ConcatWindow(QMainWindow):
         self.progress.setTextVisible(True)
         self.progress.setFixedWidth(280)
         self.progress.hide()
+        self.elapsed_label = QLabel("Elapsed 0:00")
+        self.elapsed_label.setMinimumWidth(100)
+        self.elapsed_label.hide()
         self.statusBar().addWidget(self.status_label, 1)
+        self.statusBar().addPermanentWidget(self.elapsed_label)
         self.statusBar().addPermanentWidget(self.progress)
 
         self.setCentralWidget(central)
@@ -605,6 +614,22 @@ class ConcatWindow(QMainWindow):
             return f"{hours}:{minutes:02d}:{remaining_seconds:02d}"
         return f"{minutes}:{remaining_seconds:02d}"
 
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        elapsed = max(0, int(seconds))
+        hours, remainder = divmod(elapsed, 3600)
+        minutes, elapsed_seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{elapsed_seconds:02d}"
+        return f"{minutes}:{elapsed_seconds:02d}"
+
+    @Slot()
+    def _refresh_elapsed_time(self) -> None:
+        if self._started_at is None:
+            return
+        elapsed = max(0.0, monotonic() - self._started_at)
+        self.elapsed_label.setText(f"Elapsed {self._format_elapsed(elapsed)}")
+
     @Slot(object)
     def _update_progress(self, update: ConcatProgress) -> None:
         if not self._running or self._cancel_requested:
@@ -682,10 +707,16 @@ class ConcatWindow(QMainWindow):
         self._running = running
         self.progress.setVisible(running)
         if running:
+            self._started_at = monotonic()
+            self.elapsed_label.show()
+            self._refresh_elapsed_time()
+            self._elapsed_timer.start()
             self.progress.setRange(0, 0)
             self.progress.setFormat("Calculating total duration…")
             self.status_label.setText("Preparing videos…")
         else:
+            self._elapsed_timer.stop()
+            self._refresh_elapsed_time()
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
             self.progress.setFormat("%p%")
