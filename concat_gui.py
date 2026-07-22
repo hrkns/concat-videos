@@ -880,9 +880,15 @@ class ConcatWindow(QMainWindow):
 
         self.add_folder_button.setEnabled(True)
         self.add_videos_button.setEnabled(True)
-        self.move_up_button.setEnabled(bool(selected_rows) and min(selected_rows) > 0)
+        selected_row_set = set(selected_rows)
         self.move_down_button.setEnabled(
-            bool(selected_rows) and max(selected_rows) < count - 1
+            any(
+                row < count - 1 and row + 1 not in selected_row_set
+                for row in selected_rows
+            )
+        )
+        self.move_up_button.setEnabled(
+            any(row > 0 and row - 1 not in selected_row_set for row in selected_rows)
         )
         self.remove_button.setEnabled(bool(selected_rows))
         self.clear_button.setEnabled(count > 0)

@@ -79,6 +79,35 @@ def test_move_and_multi_remove_update_the_order(
     assert window.count_label.text() == "2 videos"
 
 
+def test_move_buttons_allow_movable_rows_in_boundary_multi_selection(
+    window: ConcatWindow, tmp_path: Path
+) -> None:
+    videos = [make_video(tmp_path / f"{name}.mp4") for name in "abcd"]
+    window._append_video_paths(videos)
+
+    # The top row cannot move up, but row 2 can move into the gap at row 1.
+    window.video_list.item(0).setSelected(True)
+    window.video_list.item(2).setSelected(True)
+    window._refresh_actions()
+    assert window.move_up_button.isEnabled()
+    assert window.move_down_button.isEnabled()
+
+    window._move_selected(-1)
+    assert window._video_paths() == [videos[0], videos[2], videos[1], videos[3]]
+
+    # A contiguous selection already against the top has no movable row upward.
+    assert not window.move_up_button.isEnabled()
+    assert window.move_down_button.isEnabled()
+
+    # Likewise, a bottom row does not block another selected row moving downward.
+    window.video_list.clearSelection()
+    window.video_list.item(1).setSelected(True)
+    window.video_list.item(3).setSelected(True)
+    window._refresh_actions()
+    assert window.move_up_button.isEnabled()
+    assert window.move_down_button.isEnabled()
+
+
 def test_running_and_cancelling_lock_every_mutating_action(
     window: ConcatWindow, tmp_path: Path
 ) -> None:
