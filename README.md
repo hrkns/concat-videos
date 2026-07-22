@@ -56,6 +56,11 @@ In the application you can:
    intentionally when a clip should appear more than once.
 4. Choose the output MP4 and select **Start Concatenation**.
 
+The input and output pickers remember their last-used folders between launches.
+The remembered output folder is also used for the next automatic `output.mp4`
+destination. If either saved folder no longer exists, the application falls
+back to the current source-folder or home-folder behavior.
+
 While FFmpeg is running, the input and output controls are locked and **Cancel**
 is enabled. The status bar displays elapsed wall-clock time, the completed
 percentage, and an estimated time remaining based on the videos' total duration

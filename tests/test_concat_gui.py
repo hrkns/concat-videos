@@ -8,11 +8,16 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QAbstractItemView, QApplication
 
 import concat_gui
 from concat_core import ConcatProgress
-from concat_gui import ConcatWindow
+from concat_gui import (
+    LAST_INPUT_FOLDER_KEY,
+    LAST_OUTPUT_FOLDER_KEY,
+    ConcatWindow,
+)
 
 
 @pytest.fixture(scope="session")
@@ -22,8 +27,11 @@ def qapp() -> QApplication:
 
 
 @pytest.fixture
-def window(qapp: QApplication) -> ConcatWindow:
-    widget = ConcatWindow()
+def window(qapp: QApplication, tmp_path: Path) -> ConcatWindow:
+    settings = QSettings(
+        str(tmp_path / "settings.ini"), QSettings.Format.IniFormat
+    )
+    widget = ConcatWindow(settings=settings)
     yield widget
     if widget._running:
         widget._set_running(False)
@@ -152,6 +160,7 @@ def test_dropped_folders_are_sorted_and_repeated_drops_append(
     assert Path(window.output_edit.text()).resolve() == (folder / "output.mp4").resolve()
     assert window.count_label.text() == "5 videos"
     assert "ignored 1 unsupported" in window.status_label.text().lower()
+    assert Path(str(window._settings.value(LAST_INPUT_FOLDER_KEY))).resolve() == folder.resolve()
 
 
 def test_worker_uses_visible_order_and_restores_controls_after_success(
@@ -211,6 +220,7 @@ def test_worker_uses_visible_order_and_restores_controls_after_success(
     assert "Completed:" in window.status_label.text()
     assert "fake FFmpeg completed" in window.log_view.toPlainText()
     assert completion_alerts == [output]
+    assert Path(str(window._settings.value(LAST_OUTPUT_FOLDER_KEY))).resolve() == tmp_path.resolve()
 
 
 def test_progress_displays_percentage_eta_and_unknown_fallback(
@@ -390,3 +400,53 @@ def test_completion_actions_use_system_folder_and_video_handlers(
     window._play_output_video(output)
 
     assert opened_paths == [tmp_path.resolve(), output.resolve()]
+
+
+def test_last_input_and_output_folders_persist_across_windows(
+    window: ConcatWindow,
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    input_folder = tmp_path / "remembered-input"
+    output_folder = tmp_path / "remembered-output"
+    input_folder.mkdir()
+    output_folder.mkdir()
+
+    window._remember_input_folder(input_folder)
+    window._remember_output_folder(output_folder)
+
+    reopened = ConcatWindow(settings=window._settings)
+    assert Path(reopened._input_dialog_directory()).resolve() == input_folder.resolve()
+    assert Path(reopened._output_dialog_directory()).resolve() == output_folder.resolve()
+
+    reopened._set_default_output(input_folder)
+    assert Path(reopened.output_edit.text()).resolve() == (
+        output_folder / "output.mp4"
+    ).resolve()
+    reopened.close()
+    qapp.processEvents()
+
+
+def test_missing_remembered_folders_fall_back_to_existing_defaults(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    settings = QSettings(
+        str(tmp_path / "missing-settings.ini"), QSettings.Format.IniFormat
+    )
+    settings.setValue(LAST_INPUT_FOLDER_KEY, str(tmp_path / "missing-input"))
+    settings.setValue(LAST_OUTPUT_FOLDER_KEY, str(tmp_path / "missing-output"))
+    settings.sync()
+
+    fallback_window = ConcatWindow(settings=settings)
+    source_folder = tmp_path / "source"
+    source_folder.mkdir()
+
+    assert Path(fallback_window._input_dialog_directory()).resolve() == Path.home().resolve()
+    assert Path(fallback_window._output_dialog_directory()).resolve() == Path.home().resolve()
+    fallback_window._set_default_output(source_folder)
+    assert Path(fallback_window.output_edit.text()).resolve() == (
+        source_folder / "output.mp4"
+    ).resolve()
+    fallback_window.close()
+    qapp.processEvents()

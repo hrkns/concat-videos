@@ -11,7 +11,17 @@ from pathlib import Path
 from time import monotonic
 
 try:
-    from PySide6.QtCore import QDir, QObject, QThread, QTimer, QUrl, Qt, Signal, Slot
+    from PySide6.QtCore import (
+        QDir,
+        QObject,
+        QSettings,
+        QThread,
+        QTimer,
+        QUrl,
+        Qt,
+        Signal,
+        Slot,
+    )
     from PySide6.QtGui import (
         QCloseEvent,
         QDesktopServices,
@@ -59,6 +69,8 @@ from concat_core import (
 
 VIDEO_SUFFIX = ".mp4"
 PATH_ROLE = Qt.ItemDataRole.UserRole
+LAST_INPUT_FOLDER_KEY = "folders/lastInput"
+LAST_OUTPUT_FOLDER_KEY = "folders/lastOutput"
 
 
 def _native_path(path: Path) -> str:
@@ -199,8 +211,11 @@ class ConcatWorker(QObject):
 
 
 class ConcatWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
+        self._settings = settings if settings is not None else QSettings()
+        self._last_input_folder = self._load_saved_folder(LAST_INPUT_FOLDER_KEY)
+        self._last_output_folder = self._load_saved_folder(LAST_OUTPUT_FOLDER_KEY)
         self._running = False
         self._cancel_requested = False
         self._close_after_cancel = False
@@ -357,20 +372,64 @@ class ConcatWindow(QMainWindow):
             return str(first_video.parent)
         return str(Path.home())
 
+    def _load_saved_folder(self, key: str) -> Path | None:
+        value = self._settings.value(key, "")
+        if not value:
+            return None
+        folder = Path(str(value)).expanduser()
+        return folder.resolve() if folder.is_dir() else None
+
+    @staticmethod
+    def _existing_folder(folder: Path | None) -> Path | None:
+        return folder if folder is not None and folder.is_dir() else None
+
+    def _remember_input_folder(self, folder: Path) -> None:
+        if not folder.is_dir():
+            return
+        self._last_input_folder = folder.resolve()
+        self._settings.setValue(
+            LAST_INPUT_FOLDER_KEY, os.fspath(self._last_input_folder)
+        )
+        self._settings.sync()
+
+    def _remember_output_folder(self, folder: Path) -> None:
+        self._last_output_folder = Path(
+            os.path.abspath(os.fspath(folder.expanduser()))
+        )
+        self._settings.setValue(
+            LAST_OUTPUT_FOLDER_KEY, os.fspath(self._last_output_folder)
+        )
+        self._settings.sync()
+
+    def _input_dialog_directory(self) -> str:
+        remembered = self._existing_folder(self._last_input_folder)
+        return str(remembered) if remembered is not None else self._dialog_directory()
+
+    def _output_dialog_directory(self) -> str:
+        remembered = self._existing_folder(self._last_output_folder)
+        return str(remembered) if remembered is not None else self._dialog_directory()
+
+    def _default_output_path(self, source_folder: Path) -> Path:
+        remembered = self._existing_folder(self._last_output_folder)
+        return (remembered or source_folder) / "output.mp4"
+
     def _set_default_output(self, folder: Path) -> None:
         if not self.output_edit.text().strip():
-            self.output_edit.setText(_native_path(folder / "output.mp4"))
+            self.output_edit.setText(_native_path(self._default_output_path(folder)))
 
     @Slot()
     def _choose_folder(self) -> None:
         selected = QFileDialog.getExistingDirectory(
-            self, "Add a folder of MP4 videos", self._dialog_directory()
+            self, "Add a folder of MP4 videos", self._input_dialog_directory()
         )
         if not selected:
             return
 
         folder = Path(selected).resolve()
-        excluded_output = self._output_path_or_none() or (folder / "output.mp4")
+        self._remember_input_folder(folder)
+        excluded_output = self._output_path_or_none() or self._default_output_path(
+            folder
+        )
         try:
             videos = discover_videos(folder, excluded_output=excluded_output)
         except (ConcatError, OSError, ValueError) as exc:
@@ -392,7 +451,7 @@ class ConcatWindow(QMainWindow):
         selected, _ = QFileDialog.getOpenFileNames(
             self,
             "Add MP4 videos",
-            self._dialog_directory(),
+            self._input_dialog_directory(),
             "MP4 videos (*.mp4 *.MP4)",
         )
         if not selected:
@@ -407,6 +466,7 @@ class ConcatWindow(QMainWindow):
             self.status_label.setText("No MP4 videos were selected.")
             return
 
+        self._remember_input_folder(videos[0].parent)
         self._set_default_output(videos[0].parent)
         self._append_video_paths(videos)
         self.status_label.setText(
@@ -417,7 +477,7 @@ class ConcatWindow(QMainWindow):
     def _choose_output(self) -> None:
         current = self.output_edit.text().strip()
         if not current:
-            current = str(Path(self._dialog_directory()) / "output.mp4")
+            current = str(Path(self._output_dialog_directory()) / "output.mp4")
         selected, _ = QFileDialog.getSaveFileName(
             self, "Choose output video", current, "MP4 video (*.mp4)"
         )
@@ -426,6 +486,7 @@ class ConcatWindow(QMainWindow):
         output = Path(selected)
         if not output.suffix:
             output = output.with_suffix(VIDEO_SUFFIX)
+        self._remember_output_folder(output.parent)
         self.output_edit.setText(_native_path(output))
 
     @Slot(list)
@@ -433,12 +494,15 @@ class ConcatWindow(QMainWindow):
         videos: list[Path] = []
         ignored = 0
         errors: list[str] = []
+        last_input_folder: Path | None = None
 
         for raw_path in dropped_paths:
             path = Path(raw_path).expanduser()
             if path.is_dir():
                 folder = path.resolve()
-                excluded_output = self._output_path_or_none() or (folder / "output.mp4")
+                excluded_output = (
+                    self._output_path_or_none() or self._default_output_path(folder)
+                )
                 try:
                     discovered = discover_videos(folder, excluded_output=excluded_output)
                 except (ConcatError, OSError, ValueError) as exc:
@@ -447,16 +511,20 @@ class ConcatWindow(QMainWindow):
                 if discovered:
                     self._set_default_output(folder)
                     videos.extend(discovered)
+                    last_input_folder = folder
                 else:
                     ignored += 1
             elif path.is_file() and path.suffix.lower() == VIDEO_SUFFIX:
                 resolved = path.resolve()
                 self._set_default_output(resolved.parent)
                 videos.append(resolved)
+                last_input_folder = resolved.parent
             else:
                 ignored += 1
 
         if videos:
+            if last_input_folder is not None:
+                self._remember_input_folder(last_input_folder)
             self._append_video_paths(videos)
         for error in errors:
             self._append_log(f"Could not add dropped item: {error}")
@@ -558,6 +626,7 @@ class ConcatWindow(QMainWindow):
             QMessageBox.critical(self, "Cannot start concatenation", str(exc))
             return
 
+        self._remember_output_folder(output.parent)
         self.output_edit.setText(_native_path(output))
         self.log_view.clear()
         self._append_log(f"Starting concatenation of {len(videos)} video{'s' if len(videos) != 1 else ''}.")
