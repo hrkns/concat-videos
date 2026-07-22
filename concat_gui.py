@@ -11,8 +11,16 @@ from pathlib import Path
 from time import monotonic
 
 try:
-    from PySide6.QtCore import QDir, QObject, QThread, QTimer, Qt, Signal, Slot
-    from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDragMoveEvent, QDropEvent, QPainter, QPalette
+    from PySide6.QtCore import QDir, QObject, QThread, QTimer, QUrl, Qt, Signal, Slot
+    from PySide6.QtGui import (
+        QCloseEvent,
+        QDesktopServices,
+        QDragEnterEvent,
+        QDragMoveEvent,
+        QDropEvent,
+        QPainter,
+        QPalette,
+    )
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -200,6 +208,7 @@ class ConcatWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: ConcatWorker | None = None
         self._pending_outcome: tuple[str, str] | None = None
+        self._completed_output_path: Path | None = None
         self._started_at: float | None = None
 
         self.setWindowTitle("Concatenate Videos")
@@ -556,6 +565,7 @@ class ConcatWindow(QMainWindow):
 
         self._job = job
         self._pending_outcome = None
+        self._completed_output_path = None
         self._cancel_requested = False
         self._set_running(True)
 
@@ -664,7 +674,8 @@ class ConcatWindow(QMainWindow):
 
     @Slot(object)
     def _job_succeeded(self, output_path: object) -> None:
-        message = f"Completed: {_native_path(Path(output_path))}"
+        self._completed_output_path = Path(output_path)
+        message = f"Completed: {_native_path(self._completed_output_path)}"
         self._pending_outcome = ("success", message)
         self._append_log(message)
 
@@ -693,6 +704,8 @@ class ConcatWindow(QMainWindow):
 
         if outcome == "success":
             self.status_label.setText(message)
+            if self._completed_output_path is not None and not self._close_after_cancel:
+                self._show_completion_alert(self._completed_output_path)
         elif outcome == "cancelled":
             self.status_label.setText("Concatenation cancelled. Generated files were removed.")
         else:
@@ -702,6 +715,59 @@ class ConcatWindow(QMainWindow):
 
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
+
+    def _play_completion_sound(self) -> None:
+        QApplication.alert(self, 0)
+        QApplication.beep()
+
+    def _show_completion_alert(self, output_path: Path) -> None:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setWindowTitle("Concatenation complete")
+        dialog.setText("The video was created successfully.")
+        dialog.setInformativeText(f"Output:\n{_native_path(output_path)}")
+
+        close_button = dialog.addButton(
+            "Close", QMessageBox.ButtonRole.AcceptRole
+        )
+        open_folder_button = dialog.addButton(
+            "Open Folder", QMessageBox.ButtonRole.ActionRole
+        )
+        play_button = dialog.addButton(
+            "Play Video", QMessageBox.ButtonRole.ActionRole
+        )
+        dialog.setDefaultButton(close_button)
+
+        self._play_completion_sound()
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+        if clicked is open_folder_button:
+            self._open_output_folder(output_path)
+        elif clicked is play_button:
+            self._play_output_video(output_path)
+
+    def _open_output_folder(self, output_path: Path) -> None:
+        folder = output_path.parent
+        if not folder.is_dir() or not QDesktopServices.openUrl(
+            QUrl.fromLocalFile(os.fspath(folder))
+        ):
+            QMessageBox.warning(
+                self,
+                "Could not open folder",
+                f"The output folder could not be opened:\n\n{_native_path(folder)}",
+            )
+
+    def _play_output_video(self, output_path: Path) -> None:
+        if not output_path.is_file() or not QDesktopServices.openUrl(
+            QUrl.fromLocalFile(os.fspath(output_path))
+        ):
+            QMessageBox.warning(
+                self,
+                "Could not play video",
+                "The video could not be opened with the system's default player:\n\n"
+                f"{_native_path(output_path)}",
+            )
 
     def _set_running(self, running: bool) -> None:
         self._running = running

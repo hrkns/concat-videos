@@ -163,6 +163,7 @@ def test_worker_uses_visible_order_and_restores_controls_after_success(
     videos = [make_video(tmp_path / f"{name}.mp4") for name in ("second", "first")]
     output = tmp_path / "joined.mp4"
     captured: dict[str, object] = {}
+    completion_alerts: list[Path] = []
 
     class SuccessfulJob:
         def __init__(self, video_paths: list[Path], output_path: Path) -> None:
@@ -192,6 +193,7 @@ def test_worker_uses_visible_order_and_restores_controls_after_success(
             return True
 
     monkeypatch.setattr(concat_gui, "ConcatJob", SuccessfulJob)
+    monkeypatch.setattr(window, "_show_completion_alert", completion_alerts.append)
     window._append_video_paths(videos)
     window.output_edit.setText(str(output))
 
@@ -208,6 +210,7 @@ def test_worker_uses_visible_order_and_restores_controls_after_success(
     assert not window.cancel_button.isEnabled()
     assert "Completed:" in window.status_label.text()
     assert "fake FFmpeg completed" in window.log_view.toPlainText()
+    assert completion_alerts == [output]
 
 
 def test_progress_displays_percentage_eta_and_unknown_fallback(
@@ -283,3 +286,107 @@ def test_elapsed_time_updates_from_start_and_remains_after_finish(
     assert not window._elapsed_timer.isActive()
     assert window.elapsed_label.isVisibleTo(window)
     assert window.elapsed_label.text() == "Elapsed 1:01:02"
+
+
+@pytest.mark.parametrize(
+    ("clicked_label", "expected_action"),
+    [
+        ("Close", None),
+        ("Open Folder", "folder"),
+        ("Play Video", "play"),
+    ],
+)
+def test_completion_alert_sounds_and_offers_all_actions(
+    window: ConcatWindow,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clicked_label: str,
+    expected_action: str | None,
+) -> None:
+    output = make_video(tmp_path / "joined.mp4")
+    sounded: list[bool] = []
+    actions: list[str] = []
+
+    class FakeMessageBox:
+        class Icon:
+            Information = "information"
+
+        class ButtonRole:
+            AcceptRole = "accept"
+            ActionRole = "action"
+
+        created: "FakeMessageBox | None" = None
+
+        def __init__(self, _parent: object) -> None:
+            type(self).created = self
+            self.buttons: dict[str, object] = {}
+            self.clicked: object | None = None
+            self.default_button: object | None = None
+
+        def setIcon(self, _icon: object) -> None:
+            pass
+
+        def setWindowTitle(self, _title: str) -> None:
+            pass
+
+        def setText(self, _text: str) -> None:
+            pass
+
+        def setInformativeText(self, _text: str) -> None:
+            pass
+
+        def addButton(self, label: str, _role: object) -> object:
+            button = object()
+            self.buttons[label] = button
+            return button
+
+        def setDefaultButton(self, button: object) -> None:
+            self.default_button = button
+
+        def exec(self) -> None:
+            self.clicked = self.buttons[clicked_label]
+
+        def clickedButton(self) -> object | None:
+            return self.clicked
+
+    monkeypatch.setattr(concat_gui, "QMessageBox", FakeMessageBox)
+    monkeypatch.setattr(
+        window, "_play_completion_sound", lambda: sounded.append(True)
+    )
+    monkeypatch.setattr(
+        window, "_open_output_folder", lambda _path: actions.append("folder")
+    )
+    monkeypatch.setattr(
+        window, "_play_output_video", lambda _path: actions.append("play")
+    )
+
+    window._show_completion_alert(output)
+
+    dialog = FakeMessageBox.created
+    assert dialog is not None
+    assert list(dialog.buttons) == ["Close", "Open Folder", "Play Video"]
+    assert dialog.default_button is dialog.buttons["Close"]
+    assert sounded == [True]
+    assert actions == ([] if expected_action is None else [expected_action])
+
+
+def test_completion_actions_use_system_folder_and_video_handlers(
+    window: ConcatWindow,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = make_video(tmp_path / "joined.mp4")
+    opened_paths: list[Path] = []
+
+    class FakeDesktopServices:
+        @staticmethod
+        def openUrl(url: object) -> bool:
+            opened_paths.append(Path(url.toLocalFile()).resolve())  # type: ignore[attr-defined]
+            return True
+
+    monkeypatch.setattr(concat_gui, "QDesktopServices", FakeDesktopServices)
+
+    window._open_output_folder(output)
+    window._play_output_video(output)
+
+    assert opened_paths == [tmp_path.resolve(), output.resolve()]

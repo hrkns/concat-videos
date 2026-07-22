@@ -63,6 +63,11 @@ and FFmpeg's current speed. If a duration cannot be read, concatenation still
 works with an indeterminate progress indicator while elapsed time continues to
 update.
 
+When concatenation finishes successfully, the application plays the system
+alert sound and shows a completion dialog with **Close**, **Open Folder**, and
+**Play Video** actions. The last two use the operating system's default folder
+viewer and video player.
+
 Cancel first stops FFmpeg and then removes the per-job manifest and partial
 output. Source videos are never cleanup targets. FFmpeg writes to a unique
 staging MP4 beside the destination and promotes it only after success, so
