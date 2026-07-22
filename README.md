@@ -1,24 +1,64 @@
-# Concatenate MP4 files from a folder with FFmpeg
+# Concatenate MP4 videos with FFmpeg
 
-This set of scripts automates the classic FFmpeg concat workflow:
+This project provides a desktop GUI and command-line scripts for the classic
+FFmpeg concat workflow:
 
 ```bash
 ffmpeg -f concat -safe 0 -i files.txt -c copy output.mp4
 ```
 
-Instead of manually creating `files.txt`, the scripts:
+Instead of manually creating `files.txt`, it can:
 
-- receive a **source folder path**
-- collect all `.mp4` files in that folder
-- sort them in **alphabetical order**
+- add every `.mp4` in a selected folder, sorted alphabetically
+- accept repeated drag-and-drops of videos from different folders
+- reorder and remove queued videos before concatenating
 - generate the temporary concat file automatically
 - call FFmpeg with `-c copy`
 
 ## Included scripts
 
+- `concat_gui.py` — desktop interface
+- `concat_core.py` — shared ordered-list and cancellation logic
 - `concat.py`
 - `concat.sh`
 - `concat.ps1`
+
+## Desktop GUI
+
+### Requirements
+
+- Python 3.10 or newer
+- FFmpeg available in `PATH`
+- the Python GUI dependency from `requirements.txt`
+
+Install the GUI dependency:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Launch the application:
+
+```bash
+python concat_gui.py
+```
+
+In the application you can:
+
+1. Select **Add Folder** to append that folder's immediate `.mp4` files in
+   alphabetical order.
+2. Select **Add Videos**, or drop MP4 files and folders onto the list. Every
+   later drop is appended, so inputs can come from several locations.
+3. Drag rows into a new order, or use **Move Up** and **Move Down**. Multiple
+   selected rows can also be removed together. Duplicate entries are allowed
+   intentionally when a clip should appear more than once.
+4. Choose the output MP4 and select **Start Concatenation**.
+
+While FFmpeg is running, the input and output controls are locked and **Cancel**
+is enabled. Cancel first stops FFmpeg and then removes the per-job manifest and
+partial output. Source videos are never cleanup targets. FFmpeg writes to a
+unique staging MP4 beside the destination and promotes it only after success,
+so cancellation or failure also preserves any pre-existing destination file.
 
 ## Important note
 
@@ -60,7 +100,7 @@ All three scripts now behave the same way:
 
 ### Requirements
 
-- Python 3
+- Python 3.10 or newer
 - FFmpeg available in `PATH`
 
 ### Usage
@@ -95,11 +135,15 @@ Explicit path elsewhere:
 python3 concat.py /path/to/folder -o /another/path/merged.mp4
 ```
 
+If the destination already exists, the CLI asks before replacing it. For an
+explicitly non-interactive overwrite, add `--overwrite` (or `-y`).
+
 ### Notes
 
 - files are sorted alphabetically by filename
 - matching is case-insensitive for `.mp4`
 - the script prints the files it will concatenate before running FFmpeg
+- a failed or cancelled run preserves any existing destination, just like the GUI
 
 ---
 
@@ -249,6 +293,23 @@ This is already handled by the scripts, as long as the output is an `.mp4` insid
 ### FFmpeg concat fails
 
 If FFmpeg errors out while using `-c copy`, the inputs may not be compatible for stream-copy concatenation. In that case, use a re-encoding workflow instead.
+
+### The GUI reports that PySide6 is missing
+
+Install the declared dependency and launch the GUI again:
+
+```bash
+python -m pip install -r requirements.txt
+python concat_gui.py
+```
+
+## Tests
+
+With `pytest` installed, run:
+
+```bash
+python -m pytest -q
+```
 
 ## Additional notes
 
