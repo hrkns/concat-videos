@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 
 import argparse
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
-
-def resolve_output_path(source_folder: Path, output_arg: str | None) -> Path:
-    if not output_arg:
-        return source_folder / "output.mp4"
-
-    output_path = Path(output_arg).expanduser()
-
-    # If only a filename is provided, place it inside the source folder.
-    if output_path.parent == Path('.'):
-        return source_folder / output_path.name
-
-    return output_path.resolve()
+from concat_core import (
+    ConcatCancelled,
+    ConcatError,
+    ConcatJob,
+    discover_videos,
+    resolve_output_path,
+)
 
 
 def main() -> int:
@@ -33,6 +26,12 @@ def main() -> int:
         "--output",
         help="Output file path or filename. If only a filename is provided, it will be created inside the source folder. Defaults to source_folder/output.mp4"
     )
+    parser.add_argument(
+        "-y",
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing output without prompting",
+    )
     args = parser.parse_args()
 
     source_folder = Path(args.folder).expanduser().resolve()
@@ -42,17 +41,11 @@ def main() -> int:
         return 1
 
     output_path = resolve_output_path(source_folder, args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path_resolved = output_path.resolve()
-
-    mp4_files = sorted(
-        [
-            f.resolve()
-            for f in source_folder.iterdir()
-            if f.is_file() and f.suffix.lower() == ".mp4" and f.resolve() != output_path_resolved
-        ],
-        key=lambda p: p.name.lower()
-    )
+    try:
+        mp4_files = discover_videos(source_folder, output_path)
+    except (OSError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
 
     if not mp4_files:
         print(f"Error: no .mp4 files found in '{source_folder}' (excluding output file if applicable).", file=sys.stderr)
@@ -62,39 +55,50 @@ def main() -> int:
     for f in mp4_files:
         print(f" - {f.name}")
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
-        concat_file = Path(tmp.name)
-        for video_file in mp4_files:
-            escaped = str(video_file).replace("'", r"'\\''")
-            tmp.write(f"file '{escaped}'\n")
+    try:
+        job = ConcatJob(mp4_files, output_path)
+    except (OSError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
 
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(concat_file),
-        "-c", "copy",
-        str(output_path_resolved),
-    ]
-
-    print("\nRunning:")
-    print(" ".join(ffmpeg_cmd))
+    if output_path.exists() and not args.overwrite:
+        if not sys.stdin.isatty():
+            print(
+                f"Error: output already exists: '{output_path}'. "
+                "Use --overwrite to replace it.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            answer = input(f"\nOutput already exists: '{output_path}'. Replace it? [y/N] ")
+        except EOFError:
+            print(
+                f"\nError: output already exists: '{output_path}'. "
+                "Use --overwrite to replace it.",
+                file=sys.stderr,
+            )
+            return 1
+        except KeyboardInterrupt:
+            print("\nCancelled; the existing output was not changed.", file=sys.stderr)
+            return 130
+        if answer.strip().casefold() not in {"y", "yes"}:
+            print("Cancelled; the existing output was not changed.")
+            return 0
 
     try:
-        subprocess.run(ffmpeg_cmd, check=True)
-        print(f"\nDone. Output created at: {output_path_resolved}")
+        job.run(print)
+        print(f"\nDone. Output created at: {output_path}")
         return 0
-    except FileNotFoundError:
-        print("Error: ffmpeg was not found in PATH.", file=sys.stderr)
-        return 1
-    except subprocess.CalledProcessError as e:
-        print(f"Error: ffmpeg failed with exit code {e.returncode}.", file=sys.stderr)
-        return e.returncode
-    finally:
-        try:
-            concat_file.unlink(missing_ok=True)
-        except Exception:
-            pass
+    except ConcatCancelled:
+        print("\nConcatenation cancelled.", file=sys.stderr)
+        return 130
+    except KeyboardInterrupt:
+        job.cancel()
+        print("\nConcatenation cancelled.", file=sys.stderr)
+        return 130
+    except (ConcatError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return error.exit_code if isinstance(error, ConcatError) and error.exit_code else 1
 
 
 if __name__ == "__main__":

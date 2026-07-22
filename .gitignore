@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# In-progress output files are normally removed by ConcatJob cleanup.
+.*.concat-*.mp4
