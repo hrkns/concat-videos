@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
+from math import ceil, isfinite
 from pathlib import Path
 
 try:
@@ -38,7 +39,13 @@ except ModuleNotFoundError as exc:
         ) from None
     raise
 
-from concat_core import ConcatCancelled, ConcatError, ConcatJob, discover_videos
+from concat_core import (
+    ConcatCancelled,
+    ConcatError,
+    ConcatJob,
+    ConcatProgress,
+    discover_videos,
+)
 
 
 VIDEO_SUFFIX = ".mp4"
@@ -147,6 +154,7 @@ class ConcatWorker(QObject):
     """Run a blocking ConcatJob away from the GUI thread."""
 
     log_message = Signal(str)
+    progress_updated = Signal(object)
     succeeded = Signal(object)
     failed = Signal(str)
     cancelled = Signal(str)
@@ -159,10 +167,16 @@ class ConcatWorker(QObject):
     def _relay_log(self, message: object) -> None:
         self.log_message.emit(str(message))
 
+    def _relay_progress(self, progress: ConcatProgress) -> None:
+        self.progress_updated.emit(progress)
+
     @Slot()
     def run(self) -> None:
         try:
-            output_path = self._job.run(log_callback=self._relay_log)
+            output_path = self._job.run(
+                log_callback=self._relay_log,
+                progress_callback=self._relay_progress,
+            )
         except ConcatCancelled as exc:
             self.cancelled.emit(str(exc) or "Concatenation cancelled.")
         except ConcatError as exc:
@@ -284,8 +298,8 @@ class ConcatWindow(QMainWindow):
 
         self.status_label = QLabel("Ready — add one or more videos.")
         self.progress = QProgressBar()
-        self.progress.setTextVisible(False)
-        self.progress.setFixedWidth(140)
+        self.progress.setTextVisible(True)
+        self.progress.setFixedWidth(280)
         self.progress.hide()
         self.statusBar().addWidget(self.status_label, 1)
         self.statusBar().addPermanentWidget(self.progress)
@@ -541,6 +555,7 @@ class ConcatWindow(QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.log_message.connect(self._append_log)
+        worker.progress_updated.connect(self._update_progress)
         worker.succeeded.connect(self._job_succeeded)
         worker.failed.connect(self._job_failed)
         worker.cancelled.connect(self._job_cancelled)
@@ -560,6 +575,10 @@ class ConcatWindow(QMainWindow):
         self._cancel_requested = True
         self.status_label.setText("Cancelling…")
         self._append_log("Cancellation requested. Cleaning up generated files…")
+        current_value = self.progress.value() if self.progress.maximum() > 0 else 0
+        self.progress.setRange(0, 100)
+        self.progress.setValue(max(0, current_value))
+        self.progress.setFormat(f"{max(0, current_value)}% · Cancelling…")
         self._refresh_actions()
 
         if self._job is not None:
@@ -576,6 +595,47 @@ class ConcatWindow(QMainWindow):
         text = str(message).rstrip()
         if text:
             self.log_view.appendPlainText(text)
+
+    @staticmethod
+    def _format_remaining(seconds: float) -> str:
+        rounded = max(0, ceil(seconds))
+        hours, remainder = divmod(rounded, 3600)
+        minutes, remaining_seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{remaining_seconds:02d}"
+        return f"{minutes}:{remaining_seconds:02d}"
+
+    @Slot(object)
+    def _update_progress(self, update: ConcatProgress) -> None:
+        if not self._running or self._cancel_requested:
+            return
+
+        self.status_label.setText("Concatenating videos…")
+        fraction = update.fraction
+        if fraction is None or not isfinite(fraction):
+            self.status_label.setText(
+                "Concatenating videos — time remaining unavailable."
+            )
+            self.progress.setRange(0, 0)
+            self.progress.setFormat("Time remaining unavailable")
+            return
+
+        self.progress.setRange(0, 100)
+        percent = max(0, min(100, int(fraction * 100)))
+        percent = max(self.progress.value(), percent)
+        self.progress.setValue(percent)
+
+        eta = update.eta_seconds
+        if fraction >= 1:
+            self.progress.setValue(100)
+            self.progress.setFormat("100% · Complete")
+        elif fraction >= 0.999 or eta == 0:
+            self.progress.setFormat("%p% · Finalizing…")
+        elif eta is not None and isfinite(eta) and eta >= 0:
+            remaining = self._format_remaining(eta)
+            self.progress.setFormat(f"%p% · {remaining} remaining")
+        else:
+            self.progress.setFormat("%p% · Estimating…")
 
     @Slot(object)
     def _job_succeeded(self, output_path: object) -> None:
@@ -623,10 +683,12 @@ class ConcatWindow(QMainWindow):
         self.progress.setVisible(running)
         if running:
             self.progress.setRange(0, 0)
-            self.status_label.setText("Concatenating videos…")
+            self.progress.setFormat("Calculating total duration…")
+            self.status_label.setText("Preparing videos…")
         else:
-            self.progress.setRange(0, 1)
+            self.progress.setRange(0, 100)
             self.progress.setValue(0)
+            self.progress.setFormat("%p%")
             self._cancel_requested = False
         self._refresh_actions()
 

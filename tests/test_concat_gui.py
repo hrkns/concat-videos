@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QAbstractItemView, QApplication
 
 import concat_gui
+from concat_core import ConcatProgress
 from concat_gui import ConcatWindow
 
 
@@ -111,6 +112,19 @@ def test_running_and_cancelling_lock_every_mutating_action(
     assert fake_job.cancel_called
     assert not window.cancel_button.isEnabled()
     assert window.status_label.text() == "Cancelling…"
+    cancelling_format = window.progress.format()
+
+    window._update_progress(
+        ConcatProgress(
+            processed_seconds=9,
+            total_seconds=10,
+            fraction=0.9,
+            eta_seconds=1,
+            speed=1,
+        )
+    )
+    assert window.status_label.text() == "Cancelling…"
+    assert window.progress.format() == cancelling_format
 
     window._job = None
     window._set_running(False)
@@ -155,9 +169,23 @@ def test_worker_uses_visible_order_and_restores_controls_after_success(
             captured["videos"] = list(video_paths)
             captured["output"] = output_path
 
-        def run(self, log_callback: object = None) -> Path:
+        def run(
+            self,
+            log_callback: object = None,
+            progress_callback: object = None,
+        ) -> Path:
             if callable(log_callback):
                 log_callback("fake FFmpeg completed")
+            if callable(progress_callback):
+                progress_callback(
+                    ConcatProgress(
+                        processed_seconds=5,
+                        total_seconds=10,
+                        fraction=0.5,
+                        eta_seconds=5,
+                        speed=1,
+                    )
+                )
             return output
 
         def cancel(self) -> bool:
@@ -180,3 +208,52 @@ def test_worker_uses_visible_order_and_restores_controls_after_success(
     assert not window.cancel_button.isEnabled()
     assert "Completed:" in window.status_label.text()
     assert "fake FFmpeg completed" in window.log_view.toPlainText()
+
+
+def test_progress_displays_percentage_eta_and_unknown_fallback(
+    window: ConcatWindow,
+) -> None:
+    window._set_running(True)
+    window._update_progress(
+        ConcatProgress(
+            processed_seconds=25,
+            total_seconds=100,
+            fraction=0.25,
+            eta_seconds=3661.1,
+            speed=2,
+        )
+    )
+
+    assert window.progress.minimum() == 0
+    assert window.progress.maximum() == 100
+    assert window.progress.value() == 25
+    assert window.progress.format() == "%p% · 1:01:02 remaining"
+    assert window.status_label.text() == "Concatenating videos…"
+
+    # A delayed older update cannot move the displayed percentage backwards.
+    window._update_progress(
+        ConcatProgress(
+            processed_seconds=10,
+            total_seconds=100,
+            fraction=0.1,
+            eta_seconds=None,
+            speed=None,
+        )
+    )
+    assert window.progress.value() == 25
+
+    window._set_running(False)
+    window._set_running(True)
+    window._update_progress(
+        ConcatProgress(
+            processed_seconds=2,
+            total_seconds=None,
+            fraction=None,
+            eta_seconds=None,
+            speed=None,
+        )
+    )
+    assert window.progress.minimum() == 0
+    assert window.progress.maximum() == 0
+    assert window.progress.format() == "Time remaining unavailable"
+    assert "time remaining unavailable" in window.status_label.text().lower()

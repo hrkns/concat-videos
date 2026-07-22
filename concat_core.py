@@ -4,15 +4,20 @@
 
 from __future__ import annotations
 
+import math
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 
 class ConcatError(RuntimeError):
@@ -28,6 +33,20 @@ class ConcatCancelled(ConcatError):
 
 
 LogCallback = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class ConcatProgress:
+    """A point-in-time snapshot of a concat operation's progress."""
+
+    processed_seconds: float
+    total_seconds: float | None
+    fraction: float | None
+    eta_seconds: float | None
+    speed: float | None
+
+
+ProgressCallback = Callable[[ConcatProgress], None]
 
 
 def absolute_path(path: Path | str) -> Path:
@@ -146,6 +165,9 @@ def build_ffmpeg_command(
         "-hide_banner",
         "-nostdin",
         "-y",
+        "-progress",
+        "pipe:1",
+        "-nostats",
         "-f",
         "concat",
         "-safe",
@@ -168,6 +190,7 @@ class ConcatJob:
 
     _POLL_SECONDS = 0.1
     _TERMINATE_GRACE_SECONDS = 3.0
+    _MAX_ACTIVE_FRACTION = 0.999
 
     def __init__(
         self,
@@ -176,6 +199,8 @@ class ConcatJob:
         ffmpeg: str = "ffmpeg",
         *,
         popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+        ffprobe: str | None = None,
+        probe_popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
     ) -> None:
         self.video_paths = _validated_video_paths(video_paths)
         # Keep the visible destination entry. Resolving the final symlink could
@@ -188,7 +213,9 @@ class ConcatJob:
             raise ValueError("The output file cannot also be one of the input videos.")
 
         self.ffmpeg = ffmpeg
+        self.ffprobe = ffprobe or self._ffprobe_for_ffmpeg(ffmpeg)
         self._popen_factory = popen_factory or subprocess.Popen
+        self._probe_popen_factory = probe_popen_factory or subprocess.Popen
         self._cancel_requested = threading.Event()
         self._state_lock = threading.Lock()
         self._process: subprocess.Popen[str] | None = None
@@ -229,7 +256,11 @@ class ConcatJob:
             self._terminate_process(process)
         return True
 
-    def run(self, log_callback: LogCallback | None = None) -> Path:
+    def run(
+        self,
+        log_callback: LogCallback | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> Path:
         """Run FFmpeg synchronously; call this method from a GUI worker thread."""
 
         log = log_callback or (lambda _message: None)
@@ -242,6 +273,24 @@ class ConcatJob:
             self._started = True
 
         try:
+            if self._cancel_requested.is_set():
+                raise ConcatCancelled("Concatenation cancelled.")
+
+            total_duration: float | None = None
+            if progress_callback is not None:
+                total_duration = self._probe_total_duration(log)
+                self._report_progress(
+                    progress_callback,
+                    ConcatProgress(
+                        processed_seconds=0.0,
+                        total_seconds=total_duration,
+                        fraction=0.0 if total_duration is not None else None,
+                        eta_seconds=None,
+                        speed=None,
+                    ),
+                    log,
+                )
+
             if self._cancel_requested.is_set():
                 raise ConcatCancelled("Concatenation cancelled.")
 
@@ -259,10 +308,11 @@ class ConcatJob:
                 process = self._popen_factory(
                     command,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
+                    stderr=subprocess.PIPE,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    bufsize=1,
                 )
             except FileNotFoundError as error:
                 raise ConcatError(
@@ -278,7 +328,12 @@ class ConcatJob:
             if cancellation_won_race and process.poll() is None:
                 self._terminate_process(process)
 
-            output = self._communicate_until_exit(process)
+            output, latest_progress = self._monitor_ffmpeg(
+                process,
+                total_duration=total_duration,
+                progress_callback=progress_callback,
+                log_callback=log,
+            )
             if output.strip():
                 log(output.rstrip())
 
@@ -305,6 +360,22 @@ class ConcatJob:
                     ) from error
                 self._committed = True
                 self._finished = True
+
+            if progress_callback is not None:
+                processed_seconds = latest_progress.processed_seconds
+                if total_duration is not None:
+                    processed_seconds = max(processed_seconds, total_duration)
+                self._report_progress(
+                    progress_callback,
+                    ConcatProgress(
+                        processed_seconds=processed_seconds,
+                        total_seconds=total_duration,
+                        fraction=1.0,
+                        eta_seconds=0.0,
+                        speed=latest_progress.speed,
+                    ),
+                    log,
+                )
 
             log(f"Output created: {self.output_path}")
             return self.output_path
@@ -345,7 +416,289 @@ class ConcatJob:
         except OSError as error:
             raise ConcatError(f"Could not prepare temporary files: {error}") from error
 
-    def _communicate_until_exit(self, process: subprocess.Popen[str]) -> str:
+    @staticmethod
+    def _ffprobe_for_ffmpeg(ffmpeg: str) -> str:
+        executable = Path(ffmpeg)
+        if executable.name.casefold() == "ffmpeg.exe":
+            return os.fspath(executable.with_name("ffprobe.exe"))
+        if executable.name.casefold() == "ffmpeg":
+            return os.fspath(executable.with_name("ffprobe"))
+        return "ffprobe"
+
+    def _probe_total_duration(self, log: LogCallback) -> float | None:
+        durations: dict[str, float] = {}
+        ordered_keys: list[str] = []
+
+        for video in self.video_paths:
+            if self._cancel_requested.is_set():
+                raise ConcatCancelled("Concatenation cancelled.")
+
+            key = os.path.normcase(os.fspath(video))
+            ordered_keys.append(key)
+            if key in durations:
+                continue
+
+            duration = self._probe_video_duration(video)
+            if duration is None:
+                log(
+                    "Could not determine every input duration. "
+                    "Progress will be shown without a percentage or ETA."
+                )
+                return None
+            durations[key] = duration
+
+        total = math.fsum(durations[key] for key in ordered_keys)
+        return total if math.isfinite(total) and total > 0 else None
+
+    def _probe_video_duration(self, video: Path) -> float | None:
+        command = [
+            self.ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            os.fspath(video),
+        ]
+
+        try:
+            process = self._probe_popen_factory(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except (FileNotFoundError, OSError):
+            return None
+
+        with self._state_lock:
+            self._process = process
+            cancellation_won_race = self._cancel_requested.is_set()
+
+        if cancellation_won_race and process.poll() is None:
+            self._terminate_process(process)
+
+        try:
+            output = self._communicate_until_exit(process, process_name="FFprobe")
+            if self._cancel_requested.is_set():
+                raise ConcatCancelled("Concatenation cancelled.")
+            if process.returncode != 0:
+                return None
+
+            try:
+                duration = float(output.strip())
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(duration) or duration <= 0:
+                return None
+            return duration
+        finally:
+            with self._state_lock:
+                if self._process is process:
+                    self._process = None
+
+    def _monitor_ffmpeg(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        total_duration: float | None,
+        progress_callback: ProgressCallback | None,
+        log_callback: LogCallback,
+    ) -> tuple[str, ConcatProgress]:
+        """Drain both child pipes without relying on unsupported Windows select()."""
+
+        stdout = getattr(process, "stdout", None)
+        stderr = getattr(process, "stderr", None)
+        initial_progress = ConcatProgress(0.0, total_duration, None, None, None)
+
+        # Keep compatibility with lightweight/custom Popen stand-ins that only
+        # implement communicate(). Real Popen instances always take the split-
+        # pipe path below.
+        if stdout is None or stderr is None:
+            output = self._communicate_until_exit(process)
+            return output, initial_progress
+
+        events: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+        def read_stream(channel: str, stream: TextIO) -> None:
+            try:
+                while True:
+                    line = stream.readline()
+                    if line == "":
+                        break
+                    events.put((channel, line.rstrip("\r\n")))
+            finally:
+                events.put((channel, None))
+
+        readers = [
+            threading.Thread(
+                target=read_stream,
+                args=("progress", stdout),
+                name="concat-ffmpeg-progress",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=read_stream,
+                args=("stderr", stderr),
+                name="concat-ffmpeg-stderr",
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+
+        open_channels = {"progress", "stderr"}
+        stderr_tail: deque[str] = deque(maxlen=200)
+        fields: dict[str, str] = {}
+        latest_progress = initial_progress
+        started_at = time.monotonic()
+        termination_deadline: float | None = None
+        kill_deadline: float | None = None
+
+        while open_channels or process.poll() is None:
+            now = time.monotonic()
+            if self._cancel_requested.is_set() and process.poll() is None:
+                if termination_deadline is None:
+                    self._terminate_process(process)
+                    termination_deadline = now + self._TERMINATE_GRACE_SECONDS
+                elif kill_deadline is None and now >= termination_deadline:
+                    self._kill_process(process)
+                    kill_deadline = now + self._TERMINATE_GRACE_SECONDS
+                elif kill_deadline is not None and now >= kill_deadline:
+                    raise ConcatError("FFmpeg did not exit after it was killed.")
+
+            try:
+                channel, line = events.get(timeout=self._POLL_SECONDS)
+            except queue.Empty:
+                continue
+
+            if line is None:
+                open_channels.discard(channel)
+                continue
+            if channel == "stderr":
+                if line.strip():
+                    stderr_tail.append(line)
+                continue
+
+            key, separator, value = line.partition("=")
+            if not separator:
+                continue
+            if key == "progress":
+                fields[key] = value
+                update = self._progress_from_fields(
+                    fields,
+                    previous=latest_progress,
+                    total_duration=total_duration,
+                    wall_elapsed=max(0.0, now - started_at),
+                )
+                fields.clear()
+                if update is not None:
+                    latest_progress = update
+                    if progress_callback is not None:
+                        self._report_progress(progress_callback, update, log_callback)
+            else:
+                fields[key] = value
+
+        for reader in readers:
+            reader.join(timeout=1.0)
+
+        return "\n".join(stderr_tail), latest_progress
+
+    @classmethod
+    def _progress_from_fields(
+        cls,
+        fields: dict[str, str],
+        *,
+        previous: ConcatProgress,
+        total_duration: float | None,
+        wall_elapsed: float,
+    ) -> ConcatProgress | None:
+        processed = cls._parse_processed_seconds(fields)
+        if processed is None:
+            return None
+        processed = max(previous.processed_seconds, processed, 0.0)
+        speed = cls._parse_speed(fields.get("speed"))
+
+        fraction: float | None = None
+        eta: float | None = None
+        if total_duration is not None and total_duration > 0:
+            fraction = min(processed / total_duration, cls._MAX_ACTIVE_FRACTION)
+            if previous.fraction is not None:
+                fraction = max(previous.fraction, fraction)
+
+            remaining = max(0.0, total_duration - processed)
+            if speed is not None:
+                eta = remaining / speed
+            elif processed > 0 and wall_elapsed >= 1.0:
+                eta = remaining * wall_elapsed / processed
+
+        return ConcatProgress(
+            processed_seconds=processed,
+            total_seconds=total_duration,
+            fraction=fraction,
+            eta_seconds=eta,
+            speed=speed,
+        )
+
+    @staticmethod
+    def _parse_processed_seconds(fields: dict[str, str]) -> float | None:
+        # Despite its historical name, FFmpeg's out_time_ms progress value is
+        # expressed in microseconds, just like out_time_us.
+        for key in ("out_time_us", "out_time_ms"):
+            value = fields.get(key)
+            if value is None:
+                continue
+            try:
+                seconds = int(value) / 1_000_000
+            except ValueError:
+                continue
+            if math.isfinite(seconds):
+                return max(0.0, seconds)
+
+        value = fields.get("out_time")
+        if not value or value.startswith("-"):
+            return None
+        try:
+            hours, minutes, seconds_text = value.split(":", 2)
+            seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds_text)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(seconds):
+            return None
+        return max(0.0, seconds)
+
+    @staticmethod
+    def _parse_speed(value: str | None) -> float | None:
+        if not value:
+            return None
+        try:
+            speed = float(value.removesuffix("x"))
+        except ValueError:
+            return None
+        if not math.isfinite(speed) or speed <= 0:
+            return None
+        return speed
+
+    @staticmethod
+    def _report_progress(
+        callback: ProgressCallback,
+        progress: ConcatProgress,
+        log: LogCallback,
+    ) -> None:
+        try:
+            callback(progress)
+        except Exception as error:
+            log(f"Could not report concatenation progress: {error}")
+
+    def _communicate_until_exit(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        process_name: str = "FFmpeg",
+    ) -> str:
         termination_deadline: float | None = None
         kill_deadline: float | None = None
         while True:
@@ -362,7 +715,9 @@ class ConcatJob:
                     self._kill_process(process)
                     kill_deadline = time.monotonic() + self._TERMINATE_GRACE_SECONDS
                 elif kill_deadline is not None and time.monotonic() >= kill_deadline:
-                    raise ConcatError("FFmpeg did not exit after it was killed.")
+                    raise ConcatError(
+                        f"{process_name} did not exit after it was killed."
+                    )
 
     def _stop_process(self, process: subprocess.Popen[str]) -> bool:
         self._terminate_process(process)

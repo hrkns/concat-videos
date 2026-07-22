@@ -29,6 +29,8 @@ Instead of manually creating `files.txt`, it can:
 
 - Python 3.10 or newer
 - FFmpeg available in `PATH`
+- FFprobe available in `PATH` for percentage and time-remaining estimates
+  (it is normally installed together with FFmpeg)
 - the Python GUI dependency from `requirements.txt`
 
 Install the GUI dependency:
@@ -55,10 +57,15 @@ In the application you can:
 4. Choose the output MP4 and select **Start Concatenation**.
 
 While FFmpeg is running, the input and output controls are locked and **Cancel**
-is enabled. Cancel first stops FFmpeg and then removes the per-job manifest and
-partial output. Source videos are never cleanup targets. FFmpeg writes to a
-unique staging MP4 beside the destination and promotes it only after success,
-so cancellation or failure also preserves any pre-existing destination file.
+is enabled. The status bar displays the completed percentage and an estimated
+time remaining based on the videos' total duration and FFmpeg's current speed.
+If a duration cannot be read, concatenation still works with an indeterminate
+progress indicator.
+
+Cancel first stops FFmpeg and then removes the per-job manifest and partial
+output. Source videos are never cleanup targets. FFmpeg writes to a unique
+staging MP4 beside the destination and promotes it only after success, so
+cancellation or failure also preserves any pre-existing destination file.
 
 ## Important note
 
